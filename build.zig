@@ -80,4 +80,33 @@ pub fn build(b: *std.Build) void {
 
     const run_boids_step = b.step("run-boids", "Run the boids example");
     run_boids_step.dependOn(&run_boids.step);
+
+    const tower_defense_module = b.createModule(.{
+        .root_source_file = b.path("examples/tower-defense.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "freecs", .module = freecs_module },
+            .{ .name = "raylib", .module = raylib },
+        },
+    });
+
+    tower_defense_module.linkLibrary(raylib_artifact);
+
+    const tower_defense = b.addExecutable(.{
+        .name = "tower-defense",
+        .root_module = tower_defense_module,
+    });
+
+    b.installArtifact(tower_defense);
+
+    const run_tower_defense = b.addRunArtifact(tower_defense);
+    run_tower_defense.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        run_tower_defense.addArgs(args);
+    }
+
+    const run_tower_defense_step = b.step("run-tower-defense", "Run the tower defense example");
+    run_tower_defense_step.dependOn(&run_tower_defense.step);
 }

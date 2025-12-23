@@ -11,6 +11,94 @@ pub const Entity = struct {
     pub const nil: Entity = .{ .id = 0, .generation = 0 };
 };
 
+pub fn EventQueue(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        items: std.ArrayListUnmanaged(T),
+
+        pub fn init() Self {
+            return .{ .items = .{} };
+        }
+
+        pub fn deinit(self: *Self, allocator: Allocator) void {
+            self.items.deinit(allocator);
+        }
+
+        pub fn send(self: *Self, allocator: Allocator, event: T) !void {
+            try self.items.append(allocator, event);
+        }
+
+        pub fn slice(self: *Self) []T {
+            return self.items.items;
+        }
+
+        pub fn clear(self: *Self) void {
+            self.items.clearRetainingCapacity();
+        }
+
+        pub fn count(self: *Self) usize {
+            return self.items.items.len;
+        }
+    };
+}
+
+pub fn Events(comptime EventTypes: anytype) type {
+    const event_fields = @typeInfo(@TypeOf(EventTypes)).@"struct".fields;
+
+    var fields: [event_fields.len]std.builtin.Type.StructField = undefined;
+    inline for (event_fields, 0..) |field, index| {
+        const EventType = @field(EventTypes, field.name);
+        fields[index] = .{
+            .name = field.name,
+            .type = EventQueue(EventType),
+            .default_value_ptr = null,
+            .is_comptime = false,
+            .alignment = @alignOf(EventQueue(EventType)),
+        };
+    }
+
+    return @Type(.{
+        .@"struct" = .{
+            .layout = .auto,
+            .fields = &fields,
+            .decls = &.{},
+            .is_tuple = false,
+        },
+    });
+}
+
+pub fn Schedule(comptime WorldType: type) type {
+    return struct {
+        const Self = @This();
+        const SystemFn = *const fn (*WorldType) anyerror!void;
+
+        systems: std.ArrayListUnmanaged(SystemFn),
+        allocator: Allocator,
+
+        pub fn init(allocator: Allocator) Self {
+            return .{
+                .systems = .{},
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.systems.deinit(self.allocator);
+        }
+
+        pub fn addSystem(self: *Self, system: SystemFn) !*Self {
+            try self.systems.append(self.allocator, system);
+            return self;
+        }
+
+        pub fn run(self: *Self, world: *WorldType) !void {
+            for (self.systems.items) |system| {
+                try system(world);
+            }
+        }
+    };
+}
+
 pub const EntityLocation = struct {
     archetype_index: u32,
     row: u32,
@@ -126,8 +214,26 @@ pub fn TypeInfo(comptime ComponentTypes: anytype) type {
     };
 }
 
+pub fn WorldConfig(comptime options: anytype) type {
+    const has_components = @hasField(@TypeOf(options), "components");
+    const has_resources = @hasField(@TypeOf(options), "Resources");
+    const has_events = @hasField(@TypeOf(options), "events");
+
+    const ComponentTypes = if (has_components) options.components else options;
+    const ResourcesType = if (has_resources) options.Resources else void;
+    const EventsType = if (has_events) Events(options.events) else void;
+
+    return WorldImpl(ComponentTypes, ResourcesType, EventsType);
+}
+
 pub fn World(comptime ComponentTypes: anytype) type {
+    return WorldImpl(ComponentTypes, void, void);
+}
+
+fn WorldImpl(comptime ComponentTypes: anytype, comptime ResourcesType: type, comptime EventsType: type) type {
     const TI = TypeInfo(ComponentTypes);
+    const has_resources = ResourcesType != void;
+    const has_events = EventsType != void;
 
     return struct {
         const Self = @This();
@@ -138,18 +244,32 @@ pub fn World(comptime ComponentTypes: anytype) type {
         free_entities: std.ArrayListUnmanaged(Entity),
         next_entity_id: u32,
         query_cache: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(usize)),
+        despawn_queue: std.ArrayListUnmanaged(Entity),
         allocator: Allocator,
+        resources: if (has_resources) ResourcesType else void,
+        events: if (has_events) EventsType else void,
 
         pub fn init(allocator: Allocator) Self {
-            return .{
+            return Self{
                 .locations = .{},
                 .archetypes = .{},
                 .archetype_index = .{},
                 .free_entities = .{},
                 .next_entity_id = 0,
                 .query_cache = .{},
+                .despawn_queue = .{},
                 .allocator = allocator,
+                .resources = if (has_resources) undefined else {},
+                .events = if (has_events) initEvents() else {},
             };
+        }
+
+        fn initEvents() EventsType {
+            var ev: EventsType = undefined;
+            inline for (@typeInfo(EventsType).@"struct".fields) |field| {
+                @field(ev, field.name) = field.type.init();
+            }
+            return ev;
         }
 
         pub fn deinit(self: *Self) void {
@@ -160,12 +280,52 @@ pub fn World(comptime ComponentTypes: anytype) type {
             self.locations.deinit(self.allocator);
             self.archetype_index.deinit(self.allocator);
             self.free_entities.deinit(self.allocator);
+            self.despawn_queue.deinit(self.allocator);
 
             var cache_iter = self.query_cache.valueIterator();
             while (cache_iter.next()) |cached| {
                 cached.deinit(self.allocator);
             }
             self.query_cache.deinit(self.allocator);
+
+            if (has_events) {
+                inline for (@typeInfo(EventsType).@"struct".fields) |field| {
+                    @field(self.events, field.name).deinit(self.allocator);
+                }
+            }
+        }
+
+        pub fn send(self: *Self, comptime event_name: []const u8, event: anytype) !void {
+            if (!has_events) @compileError("World has no events configured");
+            try @field(self.events, event_name).send(self.allocator, event);
+        }
+
+        pub fn eventSlice(self: *Self, comptime event_name: []const u8) []@TypeOf(@field(self.events, event_name).items.items[0]) {
+            if (!has_events) @compileError("World has no events configured");
+            return @field(self.events, event_name).slice();
+        }
+
+        pub fn clearEvents(self: *Self, comptime event_name: []const u8) void {
+            if (!has_events) @compileError("World has no events configured");
+            @field(self.events, event_name).clear();
+        }
+
+        pub fn clearAllEvents(self: *Self) void {
+            if (!has_events) return;
+            inline for (@typeInfo(EventsType).@"struct".fields) |field| {
+                @field(self.events, field.name).clear();
+            }
+        }
+
+        pub fn queueDespawn(self: *Self, entity: Entity) !void {
+            try self.despawn_queue.append(self.allocator, entity);
+        }
+
+        pub fn applyDespawns(self: *Self) void {
+            for (self.despawn_queue.items) |entity| {
+                _ = self.despawn(entity);
+            }
+            self.despawn_queue.clearRetainingCapacity();
         }
 
         const TypeInfoEntry = struct {
@@ -700,13 +860,15 @@ pub fn World(comptime ComponentTypes: anytype) type {
             const target_arch_idx: usize = @intCast(target_arch_idx_signed);
             try self.moveEntity(entity, loc.archetype_index, loc.row, target_arch_idx);
 
-            const new_loc = self.locations.items[entity.id];
-            const to_arch = &self.archetypes.items[new_loc.archetype_index];
-            const col_idx: usize = @intCast(to_arch.column_bits[bit_idx]);
-            const col = &to_arch.columns.items[col_idx];
-            const offset = new_loc.row * col.elem_size;
-            const ptr: *T = @ptrCast(@alignCast(&col.data.items[offset]));
-            ptr.* = value;
+            if (@sizeOf(T) > 0) {
+                const new_loc = self.locations.items[entity.id];
+                const to_arch = &self.archetypes.items[new_loc.archetype_index];
+                const col_idx: usize = @intCast(to_arch.column_bits[bit_idx]);
+                const col = &to_arch.columns.items[col_idx];
+                const offset = new_loc.row * col.elem_size;
+                const ptr: *T = @ptrCast(@alignCast(&col.data.items[offset]));
+                ptr.* = value;
+            }
 
             return true;
         }
@@ -1627,4 +1789,161 @@ test "spawn batch single component" {
         try testing.expectEqual(@as(f32, 42), pos.?.x);
         try testing.expectEqual(@as(f32, 99), pos.?.y);
     }
+}
+
+test "events send and collect" {
+    const EnemyDied = struct {
+        entity_id: u32,
+        reward: u32,
+    };
+
+    const WaveCompleted = struct {
+        wave: u32,
+    };
+
+    const GameWorld = WorldConfig(.{
+        .components = .{ Position, Velocity },
+        .events = .{
+            .enemy_died = EnemyDied,
+            .wave_completed = WaveCompleted,
+        },
+    });
+
+    var world = GameWorld.init(testing.allocator);
+    defer world.deinit();
+
+    try world.send("enemy_died", EnemyDied{ .entity_id = 1, .reward = 10 });
+    try world.send("enemy_died", EnemyDied{ .entity_id = 2, .reward = 20 });
+    try world.send("wave_completed", WaveCompleted{ .wave = 1 });
+
+    const died_events = world.eventSlice("enemy_died");
+    try testing.expectEqual(@as(usize, 2), died_events.len);
+    try testing.expectEqual(@as(u32, 1), died_events[0].entity_id);
+    try testing.expectEqual(@as(u32, 2), died_events[1].entity_id);
+    world.clearEvents("enemy_died");
+
+    const wave_events = world.eventSlice("wave_completed");
+    try testing.expectEqual(@as(usize, 1), wave_events.len);
+    try testing.expectEqual(@as(u32, 1), wave_events[0].wave);
+    world.clearEvents("wave_completed");
+
+    const more_died = world.eventSlice("enemy_died");
+    try testing.expectEqual(@as(usize, 0), more_died.len);
+}
+
+test "resources" {
+    const GameResources = struct {
+        money: u32,
+        lives: u32,
+        wave: u32,
+    };
+
+    const GameWorld = WorldConfig(.{
+        .components = .{ Position, Velocity },
+        .Resources = GameResources,
+    });
+
+    var world = GameWorld.init(testing.allocator);
+    defer world.deinit();
+
+    world.resources = GameResources{
+        .money = 100,
+        .lives = 3,
+        .wave = 1,
+    };
+
+    try testing.expectEqual(@as(u32, 100), world.resources.money);
+    try testing.expectEqual(@as(u32, 3), world.resources.lives);
+
+    world.resources.money += 50;
+    try testing.expectEqual(@as(u32, 150), world.resources.money);
+}
+
+var test_schedule_call_count: u32 = 0;
+
+fn testScheduleSystem1(w: *World(.{ Position, Velocity })) !void {
+    _ = w;
+    test_schedule_call_count += 1;
+}
+
+fn testScheduleSystem2(w: *World(.{ Position, Velocity })) !void {
+    _ = w;
+    test_schedule_call_count += 10;
+}
+
+test "schedule" {
+    const GameWorld = World(.{ Position, Velocity });
+    var world = GameWorld.init(testing.allocator);
+    defer world.deinit();
+
+    _ = try world.spawn(.{ Position{ .x = 0, .y = 0 }, Velocity{ .x = 1, .y = 2 } });
+
+    test_schedule_call_count = 0;
+
+    var schedule = Schedule(GameWorld).init(testing.allocator);
+    defer schedule.deinit();
+
+    _ = try schedule.addSystem(testScheduleSystem1);
+    _ = try schedule.addSystem(testScheduleSystem2);
+
+    try schedule.run(&world);
+    try testing.expectEqual(@as(u32, 11), test_schedule_call_count);
+}
+
+test "queue despawn and apply" {
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    const e1 = try world.spawn(.{Position{ .x = 1, .y = 0 }});
+    const e2 = try world.spawn(.{Position{ .x = 2, .y = 0 }});
+    const e3 = try world.spawn(.{Position{ .x = 3, .y = 0 }});
+
+    try testing.expectEqual(@as(usize, 3), world.entityCount());
+
+    try world.queueDespawn(e1);
+    try world.queueDespawn(e3);
+
+    try testing.expectEqual(@as(usize, 3), world.entityCount());
+
+    world.applyDespawns();
+
+    try testing.expectEqual(@as(usize, 1), world.entityCount());
+    try testing.expect(!world.isAlive(e1));
+    try testing.expect(world.isAlive(e2));
+    try testing.expect(!world.isAlive(e3));
+}
+
+test "world with all features" {
+    const GameResources = struct {
+        score: u32,
+    };
+
+    const ScoreEvent = struct {
+        points: u32,
+    };
+
+    const GameWorld = WorldConfig(.{
+        .components = .{ Position, Velocity },
+        .Resources = GameResources,
+        .events = .{
+            .score_gained = ScoreEvent,
+        },
+    });
+
+    var world = GameWorld.init(testing.allocator);
+    defer world.deinit();
+
+    world.resources = GameResources{ .score = 0 };
+
+    const entity = try world.spawn(.{ Position{ .x = 0, .y = 0 }, Velocity{ .x = 1, .y = 1 } });
+
+    try world.send("score_gained", ScoreEvent{ .points = 100 });
+
+    for (world.eventSlice("score_gained")) |event| {
+        world.resources.score += event.points;
+    }
+    world.clearEvents("score_gained");
+
+    try testing.expectEqual(@as(u32, 100), world.resources.score);
+    try testing.expect(world.isAlive(entity));
 }

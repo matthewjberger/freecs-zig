@@ -9,6 +9,9 @@ build:
 run:
     zig build run-boids
 
+run-td:
+    zig build run-tower-defense
+
 test:
     zig build test
 
