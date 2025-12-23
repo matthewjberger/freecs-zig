@@ -4,14 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const freecs_module = b.createModule(.{
+        .root_source_file = b.path("src/freecs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const lib = b.addLibrary(.{
         .linkage = .static,
         .name = "freecs",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/freecs.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = freecs_module,
     });
 
     b.installArtifact(lib);
@@ -41,4 +43,41 @@ pub fn build(b: *std.Build) void {
 
     const check = b.step("check", "Check if code compiles");
     check.dependOn(&lib_check.step);
+
+    const raylib_dep = b.dependency("raylib_zig", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const raylib = raylib_dep.module("raylib");
+    const raylib_artifact = raylib_dep.artifact("raylib");
+
+    const boids_module = b.createModule(.{
+        .root_source_file = b.path("examples/boids.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "freecs", .module = freecs_module },
+            .{ .name = "raylib", .module = raylib },
+        },
+    });
+
+    boids_module.linkLibrary(raylib_artifact);
+
+    const boids = b.addExecutable(.{
+        .name = "boids",
+        .root_module = boids_module,
+    });
+
+    b.installArtifact(boids);
+
+    const run_boids = b.addRunArtifact(boids);
+    run_boids.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        run_boids.addArgs(args);
+    }
+
+    const run_boids_step = b.step("run-boids", "Run the boids example");
+    run_boids_step.dependOn(&run_boids.step);
 }

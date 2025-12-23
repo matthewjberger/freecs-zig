@@ -6,6 +6,9 @@ set windows-shell := ["powershell.exe"]
 build:
     zig build
 
+run:
+    zig build run-boids
+
 test:
     zig build test
 

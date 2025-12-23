@@ -1,0 +1,11 @@
+zig-out/
+.zig-cache/
+zig-cache/
+
+*.dll
+*.lib
+*.exe
+*.pdb
+
+include/
+lib/

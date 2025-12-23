@@ -1455,3 +1455,176 @@ test "spawn batch with init" {
     try testing.expectEqual(@as(f32, 10), pos1.?.x);
     try testing.expectEqual(@as(f32, 20), pos2.?.x);
 }
+
+test "despawn batch" {
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    var entities: [5]Entity = undefined;
+    for (0..5) |i| {
+        entities[i] = try world.spawn(.{Position{ .x = @floatFromInt(i), .y = 0 }});
+    }
+
+    try testing.expectEqual(@as(usize, 5), world.entityCount());
+
+    const despawned = world.despawnBatch(entities[1..4]);
+    try testing.expectEqual(@as(usize, 3), despawned);
+    try testing.expectEqual(@as(usize, 2), world.entityCount());
+
+    try testing.expect(world.isAlive(entities[0]));
+    try testing.expect(!world.isAlive(entities[1]));
+    try testing.expect(!world.isAlive(entities[2]));
+    try testing.expect(!world.isAlive(entities[3]));
+    try testing.expect(world.isAlive(entities[4]));
+}
+
+test "reserve entities" {
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    try world.reserveEntities(1000);
+
+    try testing.expect(world.locations.capacity >= 1000);
+}
+
+test "forEach callback" {
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    _ = try world.spawn(.{Position{ .x = 1, .y = 0 }});
+    _ = try world.spawn(.{Position{ .x = 2, .y = 0 }});
+    _ = try world.spawn(.{Position{ .x = 3, .y = 0 }});
+
+    const POSITION = TestWorld.getBit(Position);
+
+    const Callback = struct {
+        var sum: f32 = 0;
+        fn call(arch: *Archetype, index: usize) void {
+            const positions = TestWorld.column(arch, Position).?;
+            sum += positions[index].x;
+        }
+    };
+
+    Callback.sum = 0;
+    try world.forEach(POSITION, Callback.call, 0);
+    try testing.expectEqual(@as(f32, 6), Callback.sum);
+}
+
+test "forEachTable callback" {
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    _ = try world.spawn(.{Position{ .x = 10, .y = 0 }});
+    _ = try world.spawn(.{Position{ .x = 20, .y = 0 }});
+    _ = try world.spawn(.{ Position{ .x = 30, .y = 0 }, Velocity{ .x = 1, .y = 0 } });
+
+    const POSITION = TestWorld.getBit(Position);
+
+    const TableCallback = struct {
+        var table_count: usize = 0;
+        var entity_count: usize = 0;
+        fn call(arch: *Archetype) void {
+            table_count += 1;
+            entity_count += arch.entities.items.len;
+        }
+    };
+
+    TableCallback.table_count = 0;
+    TableCallback.entity_count = 0;
+    try world.forEachTable(POSITION, TableCallback.call, 0);
+    try testing.expectEqual(@as(usize, 2), TableCallback.table_count);
+    try testing.expectEqual(@as(usize, 3), TableCallback.entity_count);
+}
+
+test "getUnchecked performance path" {
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    const entity = try world.spawn(.{ Position{ .x = 42, .y = 99 }, Velocity{ .x = 1, .y = 2 } });
+
+    const pos = world.getUnchecked(entity, Position);
+    try testing.expectEqual(@as(f32, 42), pos.x);
+    try testing.expectEqual(@as(f32, 99), pos.y);
+
+    pos.x = 100;
+    const pos2 = world.get(entity, Position);
+    try testing.expectEqual(@as(f32, 100), pos2.?.x);
+}
+
+test "columnUnchecked" {
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    _ = try world.spawn(.{ Position{ .x = 1, .y = 2 }, Velocity{ .x = 10, .y = 20 } });
+    _ = try world.spawn(.{ Position{ .x = 3, .y = 4 }, Velocity{ .x = 30, .y = 40 } });
+
+    const arch = &world.archetypes.items[0];
+    const positions = TestWorld.columnUnchecked(arch, Position);
+    const velocities = TestWorld.columnUnchecked(arch, Velocity);
+
+    try testing.expectEqual(@as(usize, 2), positions.len);
+    try testing.expectEqual(@as(usize, 2), velocities.len);
+    try testing.expectEqual(@as(f32, 1), positions[0].x);
+    try testing.expectEqual(@as(f32, 10), velocities[0].x);
+}
+
+test "query entities collection" {
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    const e1 = try world.spawn(.{Position{ .x = 1, .y = 0 }});
+    const e2 = try world.spawn(.{Position{ .x = 2, .y = 0 }});
+    _ = try world.spawn(.{Velocity{ .x = 0, .y = 0 }});
+
+    const POSITION = TestWorld.getBit(Position);
+
+    var entities = try world.queryEntities(POSITION, 0);
+    defer entities.deinit(world.allocator);
+
+    try testing.expectEqual(@as(usize, 2), entities.items.len);
+    try testing.expect(entities.items[0].id == e1.id or entities.items[0].id == e2.id);
+}
+
+test "add existing component updates value" {
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    const entity = try world.spawn(.{Position{ .x = 1, .y = 2 }});
+
+    _ = try world.addComponent(entity, Position{ .x = 100, .y = 200 });
+
+    const pos = world.get(entity, Position);
+    try testing.expect(pos != null);
+    try testing.expectEqual(@as(f32, 100), pos.?.x);
+    try testing.expectEqual(@as(f32, 200), pos.?.y);
+}
+
+test "remove last component despawns entity" {
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    const entity = try world.spawn(.{Position{ .x = 1, .y = 2 }});
+    try testing.expect(world.isAlive(entity));
+
+    _ = try world.removeComponent(entity, Position);
+
+    try testing.expect(!world.isAlive(entity));
+}
+
+test "spawn batch single component" {
+    var world = TestWorld.init(testing.allocator);
+    defer world.deinit();
+
+    const entities = try world.spawnBatch(5, Position, Position{ .x = 42, .y = 99 });
+    defer world.allocator.free(entities);
+
+    try testing.expectEqual(@as(usize, 5), entities.len);
+    try testing.expectEqual(@as(usize, 5), world.entityCount());
+
+    for (entities) |entity| {
+        const pos = world.get(entity, Position);
+        try testing.expect(pos != null);
+        try testing.expectEqual(@as(f32, 42), pos.?.x);
+        try testing.expectEqual(@as(f32, 99), pos.?.y);
+    }
+}
